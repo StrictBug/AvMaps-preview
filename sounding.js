@@ -19,6 +19,7 @@
     const DEFAULT_SOUNDING_MODEL = 'gfs_seamless';
     const MAP_LOCATION_VALUE = '__map__';
     const AERODROME_CSV_URL = 'aerodrome_lat_long.csv';
+    /** Primary profile views — mutually exclusive. TAF docks under these. */
     const PROFILE_TOOLS = {
         sonde: {
             id: 'sonde',
@@ -42,6 +43,13 @@
             panelLabel: 'Profile table',
         },
     };
+    const TAF_TOOL = {
+        id: 'taf',
+        buttonId: 'taf-tool-btn',
+        label: 'TAF preview',
+        title: 'TAF preview (Y) — alone or docked under a profile tool',
+        panelLabel: 'TAF preview',
+    };
 
     const profileCache = new Map();
     const hourlyCache = new Map();
@@ -61,11 +69,24 @@
     let loadingEl;
     let hoverEl;
     let closeBtn;
-    let modelSelectEl;
+    let modelToggleEl;
+    let modelToggleButtons = [];
     let locationSelectEl;
     let viewStackEl;
     let tableWrapEl;
     let tableBodyEl;
+    let tafPreviewEl;
+    let tafPreviewTextEl;
+    let tafCopyBtn;
+    let tafDurationButtons = [];
+    let tafStartControlEl = null;
+    let tafStartSliderEl = null;
+    let tafStartValueEl = null;
+    let tafStartOptions = [];
+    let tafStartSliderBound = false;
+    let tafCopyResetTimer = null;
+    let tafLoadGeneration = 0;
+    const TAF_DURATION_PRESETS = [12, 18, 24, 30];
     let readoutEl;
     let indicesEl;
     let stormModeEl;
@@ -77,7 +98,11 @@
     let helpBodyEl;
     let helpCloseBtn;
     let toolButtons = {};
+    let tafToolButton = null;
+    /** Primary view: sonde | hodograph | table */
     let activeTool = null;
+    /** Independent dock under the primary view (session-lived). */
+    let tafPreviewOpen = false;
     let lastHodoLayout = null;
     let pinTargets = [];
     let resizeHandleEl;
@@ -145,11 +170,45 @@
         loadingEl = document.getElementById('sounding-loading');
         hoverEl = document.getElementById('sounding-hover');
         closeBtn = document.getElementById('sounding-close-btn');
-        modelSelectEl = document.getElementById('sounding-model-select');
+        modelToggleEl = document.querySelector('.sounding-model-toggle');
+        modelToggleButtons = modelToggleEl
+            ? Array.from(modelToggleEl.querySelectorAll('[data-sounding-model]'))
+            : [];
         locationSelectEl = document.getElementById('sounding-location-select');
         viewStackEl = document.getElementById('sounding-view-stack');
         tableWrapEl = document.getElementById('sounding-table-wrap');
         tableBodyEl = document.getElementById('sounding-profile-table-body');
+        tafPreviewEl = document.getElementById('taf-preview');
+        tafPreviewTextEl = document.getElementById('taf-preview-text');
+        tafCopyBtn = document.getElementById('taf-copy-btn');
+        if (tafCopyBtn && !tafCopyBtn.dataset.bound) {
+            tafCopyBtn.dataset.bound = '1';
+            tafCopyBtn.addEventListener('click', copyTafPreviewText);
+        }
+        tafStartControlEl = document.querySelector('.taf-start-control');
+        tafStartSliderEl = document.getElementById('taf-start-slider');
+        tafStartValueEl = document.getElementById('taf-start-value');
+        if (tafStartSliderEl && !tafStartSliderBound) {
+            tafStartSliderBound = true;
+            tafStartSliderEl.addEventListener('input', () => {
+                handleTafStartSliderInput({ commit: false });
+            });
+            tafStartSliderEl.addEventListener('change', () => {
+                handleTafStartSliderInput({ commit: true });
+            });
+        }
+        tafDurationButtons = Array.from(document.querySelectorAll('.taf-duration-btn[data-hours]'));
+        tafDurationButtons.forEach((button) => {
+            if (button.dataset.bound) {
+                return;
+            }
+            button.dataset.bound = '1';
+            button.addEventListener('click', () => {
+                const hours = Number(button.getAttribute('data-hours'));
+                applyTafDurationPreset(hours);
+            });
+        });
+        syncTafTimePresets();
         readoutEl = document.getElementById('hodograph-readout');
         indicesEl = document.getElementById('hodograph-indices');
         stormModeEl = document.getElementById('hodograph-storm-mode');
@@ -167,6 +226,7 @@
             hodograph: document.getElementById('hodograph-tool-btn'),
             table: document.getElementById('profile-table-tool-btn'),
         };
+        tafToolButton = document.getElementById(TAF_TOOL.buttonId);
         resizeHandleEl = document.getElementById('sounding-resize-handle');
         workspaceEl = document.querySelector('.map-workspace');
         pinTargets = [
@@ -191,13 +251,20 @@
         if (closeBtn) {
             closeBtn.addEventListener('click', close);
         }
-        if (modelSelectEl) {
-            modelSelectEl.value = selectedModelId;
-            modelSelectEl.addEventListener('change', () => {
-                setSelectedModel(modelSelectEl.value, { reload: panelOpen });
-                releaseProfileSelectFocus(modelSelectEl);
+        syncModelToggle();
+        modelToggleButtons.forEach((button) => {
+            if (button.dataset.bound) {
+                return;
+            }
+            button.dataset.bound = '1';
+            button.addEventListener('click', () => {
+                setSelectedModel(button.getAttribute('data-sounding-model'), {
+                    reload: panelOpen,
+                    // Only retarget the map when a model row is already isolated.
+                    syncMapIfIsolated: true,
+                });
             });
-        }
+        });
         if (locationSelectEl) {
             locationSelectEl.addEventListener('change', () => {
                 handleLocationSelect(locationSelectEl.value);
@@ -214,6 +281,12 @@
                 toggleTool(toolId);
             });
         });
+        if (tafToolButton && !tafToolButton.dataset.bound) {
+            tafToolButton.dataset.bound = '1';
+            tafToolButton.addEventListener('click', () => {
+                toggleTafPreview();
+            });
+        }
         bindResizeHandle();
         bindHoverInteractions();
         window.addEventListener('resize', () => {
@@ -384,7 +457,8 @@
     }
 
     function syncToolUi() {
-        document.body.classList.toggle('sounding-tool-active', toolEnabled);
+        const anyArmed = Boolean(activeTool) || tafPreviewOpen;
+        document.body.classList.toggle('sounding-tool-active', anyArmed && toolsAvailable);
         Object.keys(PROFILE_TOOLS).forEach((toolId) => {
             const button = toolButtons[toolId];
             const meta = PROFILE_TOOLS[toolId];
@@ -399,8 +473,24 @@
             button.title = toolsAvailable ? meta.title : 'Profile tools are not used on Policy maps';
             button.setAttribute('aria-label', toolsAvailable ? meta.title : `${meta.title}, unavailable on Policy maps`);
         });
+        if (tafToolButton) {
+            tafToolButton.disabled = !toolsAvailable;
+            tafToolButton.classList.toggle('active', tafPreviewOpen && toolsAvailable);
+            tafToolButton.setAttribute('aria-pressed', tafPreviewOpen && toolsAvailable ? 'true' : 'false');
+            tafToolButton.setAttribute('aria-disabled', toolsAvailable ? 'false' : 'true');
+            const tafTitle = toolsAvailable
+                ? TAF_TOOL.title
+                : 'Profile tools are not used on Policy maps';
+            tafToolButton.title = tafTitle;
+            tafToolButton.setAttribute(
+                'aria-label',
+                toolsAvailable ? TAF_TOOL.title : `${TAF_TOOL.label}, unavailable on Policy maps`,
+            );
+        }
         if (panelEl) {
-            panelEl.setAttribute('aria-label', PROFILE_TOOLS[activeTool]?.panelLabel || 'Profile panel');
+            const panelLabel = PROFILE_TOOLS[activeTool]?.panelLabel
+                || (tafPreviewOpen ? TAF_TOOL.panelLabel : 'Profile panel');
+            panelEl.setAttribute('aria-label', panelLabel);
         }
         syncProfileViewMode();
     }
@@ -408,13 +498,22 @@
     function syncProfileViewMode() {
         const showTable = activeTool === 'table';
         const showHodograph = activeTool === 'hodograph';
-        canvasWrapEl?.classList.toggle('hidden', showTable);
-        tableWrapEl?.classList.toggle('hidden', !showTable);
-        readoutEl?.classList.toggle('hidden', !showHodograph);
-        bunkersLegendEl?.classList.toggle('hidden', !showHodograph);
-        viewStackEl?.classList.toggle('is-hodograph', showHodograph);
-        if (showTable || showHodograph) {
+        const tafOnly = tafPreviewOpen && !activeTool;
+        const tafDocked = tafPreviewOpen && Boolean(activeTool);
+        // Canvas hosts sonde + hodograph; hide for table or TAF-only.
+        canvasWrapEl?.classList.toggle('hidden', showTable || tafOnly);
+        tableWrapEl?.classList.toggle('hidden', !showTable || tafOnly);
+        tafPreviewEl?.classList.toggle('hidden', !tafPreviewOpen);
+        readoutEl?.classList.toggle('hidden', !showHodograph || tafOnly);
+        bunkersLegendEl?.classList.toggle('hidden', !showHodograph || tafOnly);
+        viewStackEl?.classList.toggle('is-hodograph', showHodograph && !tafOnly);
+        viewStackEl?.classList.toggle('is-taf-docked', tafDocked);
+        viewStackEl?.classList.toggle('is-taf', tafOnly);
+        if (showTable || showHodograph || tafOnly) {
             endPanInteraction();
+        }
+        if (tafPreviewOpen) {
+            syncTafDurationPresets();
         }
         if (activeTool !== 'sonde' && activeTool !== 'hodograph') {
             hideHoverReadout();
@@ -431,20 +530,69 @@
             return;
         }
         activeTool = next;
-        toolEnabled = Boolean(next);
+        toolEnabled = Boolean(next) || tafPreviewOpen;
         hideHoverReadout();
         syncToolUi();
-        if (panelOpen && lastProfile) {
+        if (panelOpen && Number.isFinite(pinLat) && Number.isFinite(pinLon)) {
             requestAnimationFrame(() => {
                 requestAnimationFrame(() => {
-                    renderActiveView(lastProfile, { preserveHover: false });
+                    if (lastProfile) {
+                        renderActiveView(lastProfile, { preserveHover: false });
+                    } else {
+                        const validTime = currentValidTime();
+                        if (validTime) {
+                            loadProfileForPin(validTime, { showLoading: true });
+                        }
+                    }
+                    if (tafPreviewOpen) {
+                        loadTafDraft({ showLoading: false });
+                    }
                 });
             });
         }
     }
 
+    function setTafPreviewOpen(open, { reload = true } = {}) {
+        ensureUi();
+        const next = Boolean(open) && toolsAvailable;
+        if (tafPreviewOpen === next) {
+            if (next && reload && panelOpen) {
+                loadTafDraft({ showLoading: false });
+            }
+            return;
+        }
+        tafPreviewOpen = next;
+        // TAF alone is allowed (full-panel preview). With a primary tool it docks below.
+        toolEnabled = Boolean(activeTool) || tafPreviewOpen;
+        syncToolUi();
+        if (tafPreviewOpen && reload && panelOpen && Number.isFinite(pinLat) && Number.isFinite(pinLon)) {
+            loadTafDraft({ showLoading: !activeTool });
+        }
+        if (!tafPreviewOpen) {
+            tafLoadGeneration += 1;
+            if (tafPreviewTextEl) {
+                tafPreviewTextEl.textContent = '';
+            }
+            resetTafCopyButton();
+        }
+    }
+
+    function toggleTafPreview() {
+        if (!toolsAvailable) {
+            return;
+        }
+        setTafPreviewOpen(!tafPreviewOpen);
+    }
+
     function toggleTool(toolId) {
         if (!toolsAvailable) {
+            return;
+        }
+        if (toolId === 'taf') {
+            toggleTafPreview();
+            return;
+        }
+        if (!PROFILE_TOOLS[toolId]) {
             return;
         }
         if (activeTool === toolId) {
@@ -464,6 +612,7 @@
             return;
         }
         setActiveTool(null);
+        setTafPreviewOpen(false, { reload: false });
         close();
     }
 
@@ -471,6 +620,7 @@
         toolsAvailable = Boolean(available);
         if (!toolsAvailable) {
             setActiveTool(null);
+            setTafPreviewOpen(false, { reload: false });
             close();
         }
         syncToolUi();
@@ -482,6 +632,10 @@
 
     function getActiveTool() {
         return activeTool;
+    }
+
+    function isTafPreviewOpen() {
+        return tafPreviewOpen;
     }
 
     function normalizeModelId(modelId) {
@@ -503,13 +657,28 @@
         return SOUNDING_MODELS[id] || SOUNDING_MODELS[DEFAULT_SOUNDING_MODEL];
     }
 
-    function setSelectedModel(modelId, { reload = false } = {}) {
+    function syncModelToggle() {
+        modelToggleButtons.forEach((button) => {
+            const active = normalizeModelId(button.getAttribute('data-sounding-model')) === selectedModelId;
+            button.classList.toggle('active', active);
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+    }
+
+    function shortMapModelId(modelId = selectedModelId) {
+        return normalizeModelId(modelId) === SOUNDING_MODELS.icon_seamless.id ? 'icon' : 'gfs';
+    }
+
+    function setSelectedModel(modelId, { reload = false, syncMapIfIsolated = false } = {}) {
         const nextModelId = normalizeModelId(modelId);
         const changed = nextModelId !== selectedModelId;
         selectedModelId = nextModelId;
-        if (modelSelectEl && modelSelectEl.value !== selectedModelId) {
-            modelSelectEl.value = selectedModelId;
+        syncModelToggle();
+
+        if (syncMapIfIsolated) {
+            window.AnimationController?.syncIsolatedMapModel?.(shortMapModelId(selectedModelId));
         }
+
         if (!changed && !reload) {
             return;
         }
@@ -521,15 +690,13 @@
         lastProfile = null;
         resetViewExtents();
         clearDrawnProfile();
-        if (
-            reload
-            && panelOpen
-            && Number.isFinite(pinLat)
-            && Number.isFinite(pinLon)
-            && lastRequestedValidTime instanceof Date
-            && !Number.isNaN(lastRequestedValidTime.getTime())
-        ) {
-            loadProfileForPin(lastRequestedValidTime, { showLoading: true });
+        if (reload && panelOpen && Number.isFinite(pinLat) && Number.isFinite(pinLon)) {
+            if (activeTool && lastRequestedValidTime instanceof Date
+                && !Number.isNaN(lastRequestedValidTime.getTime())) {
+                loadProfileForPin(lastRequestedValidTime, { showLoading: true });
+            } else if (tafPreviewOpen) {
+                loadTafDraft({ showLoading: !activeTool });
+            }
         }
     }
 
@@ -731,6 +898,14 @@
         };
     }
 
+    function sleepMs(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function isTransientHttpStatus(status) {
+        return status === 429 || status === 502 || status === 503 || status === 504;
+    }
+
     async function fetchOpenMeteoHourly(lat, lon, validTime, modelId = selectedModelId) {
         const modelMeta = getModelMeta(modelId);
         const startDate = validTime.toISOString().slice(0, 10);
@@ -752,13 +927,22 @@
             end_date: startDate,
         });
 
-        const response = await fetch('https://api.open-meteo.com/v1/forecast', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body,
-        });
-        if (!response.ok) {
-            throw new Error(`Open-Meteo ${modelMeta.label} request failed (${response.status})`);
+        const maxAttempts = 3;
+        let response = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            response = await fetch('https://api.open-meteo.com/v1/forecast', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body,
+            });
+            if (response.ok || !isTransientHttpStatus(response.status) || attempt === maxAttempts) {
+                break;
+            }
+            // Free Open-Meteo occasionally returns 503 under load — brief backoff then retry.
+            await sleepMs(400 * attempt * attempt);
+        }
+        if (!response?.ok) {
+            throw new Error(`Open-Meteo ${modelMeta.label} request failed (${response?.status || 'network'})`);
         }
 
         const payload = await response.json();
@@ -3766,6 +3950,270 @@
         renderSkewT(profile, options);
     }
 
+    function currentValidTime() {
+        return window.AnimationController?.getValidTime?.() || lastRequestedValidTime;
+    }
+
+    function resetTafCopyButton() {
+        if (!tafCopyBtn) {
+            return;
+        }
+        if (tafCopyResetTimer) {
+            clearTimeout(tafCopyResetTimer);
+            tafCopyResetTimer = null;
+        }
+        tafCopyBtn.classList.remove('is-copied', 'is-failed');
+        tafCopyBtn.title = 'Copy TAF text';
+        tafCopyBtn.setAttribute('aria-label', 'Copy TAF text');
+        tafCopyBtn.disabled = false;
+    }
+
+    function copyTextViaTextarea(text) {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed';
+        area.style.left = '-9999px';
+        document.body.appendChild(area);
+        area.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(area);
+        if (!ok) {
+            throw new Error('execCommand copy failed');
+        }
+    }
+
+    async function copyTafPreviewText() {
+        const text = tafPreviewTextEl?.textContent?.trim() || '';
+        if (!text || !tafCopyBtn) {
+            return;
+        }
+        try {
+            if (navigator.clipboard?.writeText) {
+                try {
+                    await navigator.clipboard.writeText(text);
+                } catch (_) {
+                    copyTextViaTextarea(text);
+                }
+            } else {
+                copyTextViaTextarea(text);
+            }
+            tafCopyBtn.classList.remove('is-failed');
+            tafCopyBtn.classList.add('is-copied');
+            tafCopyBtn.title = 'Copied';
+            tafCopyBtn.setAttribute('aria-label', 'Copied');
+            if (tafCopyResetTimer) {
+                clearTimeout(tafCopyResetTimer);
+            }
+            tafCopyResetTimer = setTimeout(() => {
+                resetTafCopyButton();
+            }, 1600);
+        } catch (error) {
+            console.warn('Unable to copy TAF text:', error);
+            tafCopyBtn.classList.remove('is-copied');
+            tafCopyBtn.classList.add('is-failed');
+            tafCopyBtn.title = 'Copy failed';
+            tafCopyBtn.setAttribute('aria-label', 'Copy failed');
+            tafCopyResetTimer = setTimeout(() => {
+                resetTafCopyButton();
+            }, 1600);
+        }
+    }
+
+    async function loadTafDraft({ showLoading = true } = {}) {
+        ensureUi();
+        if (!tafPreviewOpen || !panelOpen || !Number.isFinite(pinLat) || !Number.isFinite(pinLon)) {
+            return;
+        }
+        if (!window.TafPreview?.buildDraft) {
+            if (statusEl && !activeTool) {
+                statusEl.textContent = 'TAF preview module is unavailable';
+                statusEl.classList.add('error');
+            }
+            return;
+        }
+
+        const generation = ++tafLoadGeneration;
+        // When docked under a profile tool, never grey out the skew-T / table.
+        const fullPanelLoading = showLoading && !activeTool;
+        if (fullPanelLoading) {
+            setSoundingLoading(true);
+            if (statusEl) {
+                statusEl.textContent = '';
+                statusEl.classList.remove('error');
+            }
+        }
+
+        try {
+            const draft = await window.TafPreview.buildDraft({
+                lat: pinLat,
+                lon: pinLon,
+                icao: selectedIcao,
+                modelId: selectedModelId,
+                aerodromes,
+            });
+            if (generation !== tafLoadGeneration || !tafPreviewOpen) {
+                return;
+            }
+            if (tafPreviewTextEl) {
+                tafPreviewTextEl.textContent = draft.text || '';
+            }
+            resetTafCopyButton();
+            syncTafTimePresets();
+            if (!activeTool && metaEl) {
+                metaEl.textContent = formatLatLon(pinLat, pinLon);
+            }
+            if (!activeTool && statusEl) {
+                statusEl.textContent = '';
+                statusEl.classList.remove('error');
+            }
+            if (fullPanelLoading) {
+                setSoundingLoading(false);
+            }
+        } catch (error) {
+            if (generation !== tafLoadGeneration) {
+                return;
+            }
+            console.warn('TAF draft failed:', error);
+            if (tafPreviewTextEl) {
+                tafPreviewTextEl.textContent = '';
+            }
+            if (fullPanelLoading) {
+                setSoundingLoading(false);
+            }
+            if (statusEl && !activeTool) {
+                statusEl.textContent = error?.message || 'Unable to build TAF draft';
+                statusEl.classList.add('error');
+            }
+        }
+    }
+
+    function syncTafDurationPresets() {
+        ensureUi();
+        const durationHours = window.AnimationController?.getSelectedRangeDurationHours?.();
+        tafDurationButtons.forEach((button) => {
+            const hours = Number(button.getAttribute('data-hours'));
+            const active = Number.isFinite(durationHours) && hours === durationHours;
+            button.classList.toggle('is-active', active);
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+    }
+
+    function findTafStartOptionIndex(options, selectedHour) {
+        if (!options?.length || !Number.isFinite(selectedHour)) {
+            return 0;
+        }
+        const exact = options.findIndex((option) => (
+            option.hour === selectedHour || option.frameHour === selectedHour
+        ));
+        if (exact >= 0) {
+            return exact;
+        }
+        // Nearest relative hour when the range start sits between presets.
+        let bestIndex = 0;
+        let bestDist = Number.POSITIVE_INFINITY;
+        options.forEach((option, index) => {
+            const dist = Math.abs(option.hour - selectedHour);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestIndex = index;
+            }
+        });
+        return bestIndex;
+    }
+
+    function syncTafStartPresets() {
+        ensureUi();
+        if (!tafStartSliderEl || !tafStartValueEl) {
+            return;
+        }
+        const options = (window.AnimationController?.getTafStartHourOptions?.() || [])
+            .filter((option) => option && option.enabled !== false);
+        tafStartOptions = options;
+        const family = window.AnimationController?.getModelCycleFamily?.() || '00_12';
+        if (tafStartControlEl) {
+            tafStartControlEl.dataset.cycleFamily = family;
+        }
+        if (!options.length) {
+            tafStartSliderEl.min = '0';
+            tafStartSliderEl.max = '0';
+            tafStartSliderEl.value = '0';
+            tafStartSliderEl.disabled = true;
+            tafStartValueEl.textContent = '--';
+            tafStartSliderEl.title = 'No start times available';
+            return;
+        }
+        const selectedHour = window.AnimationController?.getSelectedRangeStartHour?.();
+        const index = findTafStartOptionIndex(options, selectedHour);
+        const active = options[index] || options[0];
+        tafStartSliderEl.min = '0';
+        tafStartSliderEl.max = String(options.length - 1);
+        tafStartSliderEl.step = '1';
+        tafStartSliderEl.value = String(index);
+        tafStartSliderEl.disabled = options.length <= 1;
+        tafStartValueEl.textContent = active?.label ? `${active.label}Z` : '--';
+        tafStartSliderEl.title = active?.title || 'TAF start time';
+        tafStartSliderEl.setAttribute('aria-valuetext', active?.label ? `${active.label}Z` : '');
+    }
+
+    function handleTafStartSliderInput({ commit = false } = {}) {
+        if (!tafStartSliderEl || !tafStartOptions.length) {
+            return;
+        }
+        const index = Math.max(
+            0,
+            Math.min(tafStartOptions.length - 1, Number(tafStartSliderEl.value) || 0),
+        );
+        const option = tafStartOptions[index];
+        if (!option) {
+            return;
+        }
+        if (tafStartValueEl) {
+            tafStartValueEl.textContent = option.label ? `${option.label}Z` : '--';
+        }
+        tafStartSliderEl.title = option.title || 'TAF start time';
+        tafStartSliderEl.setAttribute('aria-valuetext', option.label ? `${option.label}Z` : '');
+        // Scrub updates the timeline live; commit rebuilds the TAF draft.
+        window.AnimationController?.setSelectedRangeStartHour?.(option.hour, {
+            notify: commit,
+        });
+        if (commit) {
+            syncTafTimePresets();
+        }
+    }
+
+    function syncTafTimePresets() {
+        syncTafStartPresets();
+        syncTafDurationPresets();
+    }
+
+    function applyTafDurationPreset(hours) {
+        if (!TAF_DURATION_PRESETS.includes(hours)) {
+            return;
+        }
+        // Re-anchoring from the current range start keeps the active preset correct
+        // after the start handle has been moved.
+        window.AnimationController?.setSelectedRangeDurationHours?.(hours);
+        syncTafTimePresets();
+    }
+
+    function applyTafStartPreset(startHour) {
+        const hour = Number(startHour);
+        if (!Number.isFinite(hour)) {
+            return;
+        }
+        window.AnimationController?.setSelectedRangeStartHour?.(hour, { notify: true });
+        syncTafTimePresets();
+    }
+
+    function refreshTafDraft() {
+        syncTafTimePresets();
+        if (!tafPreviewOpen || !panelOpen) {
+            return;
+        }
+        loadTafDraft({ showLoading: false });
+    }
+
     function renderSkewT(profile, { preserveHover = false } = {}) {
         ensureUi();
         if (!canvasEl || !profile?.levels?.length) return;
@@ -4082,8 +4530,14 @@
         await ensurePointVisibleOnMaps(lat, lon);
         syncPin();
         const validTime = currentValidTime();
+        if (!activeTool && tafPreviewOpen) {
+            await loadTafDraft({ showLoading: true });
+            return;
+        }
         if (validTime) {
             await loadProfileForPin(validTime, { showLoading: true });
+        } else if (tafPreviewOpen) {
+            await loadTafDraft({ showLoading: false });
         }
     }
 
@@ -4123,7 +4577,15 @@
         if (!panelOpen || !Number.isFinite(pinLat) || !Number.isFinite(pinLon)) {
             return;
         }
+        // TAF-only: no primary profile tool — skip skew-T/table fetch.
+        if (!activeTool && tafPreviewOpen) {
+            await loadTafDraft({ showLoading });
+            return;
+        }
         if (!(validTime instanceof Date) || Number.isNaN(validTime.getTime())) {
+            if (tafPreviewOpen) {
+                await loadTafDraft({ showLoading: false });
+            }
             return;
         }
 
@@ -4138,6 +4600,9 @@
             && Math.abs((lastProfile.longitude ?? pinLon) - pinLon) < 1e-4
         ) {
             setSoundingLoading(false);
+            if (tafPreviewOpen) {
+                loadTafDraft({ showLoading: false });
+            }
             return;
         }
 
@@ -4149,7 +4614,7 @@
             clearDrawnProfile();
             // Keep layout stable: grey the existing diagram and show a spinner overlay
             // instead of injecting status text that resizes the panel.
-            if (metaEl && (!metaEl.textContent || metaEl.textContent.includes('balloon tool') || metaEl.textContent.includes('Click a map'))) {
+            if (metaEl && !metaEl.textContent) {
                 metaEl.textContent = formatLatLon(pinLat, pinLon);
             }
             if (statusEl) {
@@ -4185,6 +4650,9 @@
             }
             renderActiveView(profile);
             setSoundingLoading(false);
+            if (tafPreviewOpen) {
+                loadTafDraft({ showLoading: false });
+            }
         } catch (error) {
             if (generation !== loadGeneration) {
                 return;
@@ -4199,6 +4667,9 @@
             if (statusEl) {
                 statusEl.textContent = error?.message || 'Unable to load profile';
             statusEl.classList.add('error');
+            }
+            if (tafPreviewOpen) {
+                loadTafDraft({ showLoading: false });
             }
             const ctx = canvasEl?.getContext('2d');
             if (ctx && canvasEl) {
@@ -4252,7 +4723,12 @@
         if (!panelOpen || !Number.isFinite(pinLat) || !Number.isFinite(pinLon)) {
             return;
         }
+        // TAF-only follows the selected range (refreshTafDraft), not the playhead.
+        if (!activeTool && tafPreviewOpen) {
+            return;
+        }
         // During scrubbing/playback, reuse the cached day payload so updates stay snappy.
+        // Docked TAF still refreshes the profile underneath.
         loadProfileForPin(validTime, { showLoading: false });
     }
 
@@ -4266,6 +4742,10 @@
         panelEl.setAttribute('aria-hidden', 'true');
         document.body.classList.remove('sounding-panel-open');
         panelOpen = false;
+        // X / Escape / forced close: drop armed tool buttons so the toolbar matches the closed panel.
+        activeTool = null;
+        tafPreviewOpen = false;
+        toolEnabled = false;
         setResizeHandleVisible(false);
         clearPanelSizeStyle();
         hideAllPins();
@@ -4287,15 +4767,19 @@
             tableBodyEl.innerHTML = '';
         }
         renderHodographReadout(null);
+        tafLoadGeneration += 1;
+        if (tafPreviewTextEl) {
+            tafPreviewTextEl.textContent = '';
+        }
+        resetTafCopyButton();
         if (metaEl) {
-            metaEl.textContent = toolEnabled
-                ? 'Click a map point to load a profile.'
-                : 'Enable a profile tool, then click a map point.';
+            metaEl.textContent = '';
         }
         if (statusEl) {
             statusEl.textContent = '';
             statusEl.classList.remove('error');
         }
+        syncToolUi();
         requestAnimationFrame(() => {
             window.dispatchEvent(new Event('resize'));
         });
@@ -4323,10 +4807,18 @@
         setToolEnabled,
         setToolsAvailable,
         toggleTool,
+        toggleTafPreview,
         getActiveTool,
+        isTafPreviewOpen,
+        getSelectedModel: () => selectedModelId,
+        setSelectedModel,
         renderSkewT,
         syncPin,
         syncToValidTime,
+        refreshTafDraft,
+        syncTafDurationPresets,
+        syncTafStartPresets,
+        syncTafTimePresets,
         refreshLocationOptions: populateLocationSelect,
     };
 

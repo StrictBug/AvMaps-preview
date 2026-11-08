@@ -18,6 +18,7 @@ on:
       - requirements.txt
       - script.js
       - sounding.js
+      - taf.js
       - styles.css
       - scripts/**
       - geo files/**
@@ -105,7 +106,7 @@ jobs:
         run: |
           rm -rf _site
           mkdir -p _site
-          cp index.html script.js sounding.js styles.css favicon.svg _site/
+          cp index.html script.js sounding.js taf.js styles.css favicon.svg _site/
           if [ -f aerodrome_lat_long.csv ]; then
             cp aerodrome_lat_long.csv _site/
           fi

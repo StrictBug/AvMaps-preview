@@ -664,6 +664,54 @@ function isAxisMaximizeActive(pair = getImagePairEl()) {
     return Boolean(getAxisMaxValue(pair, 'col') || getAxisMaxValue(pair, 'row'));
 }
 
+/** Short model id ('gfs' | 'icon') for the currently isolated map row, or null. */
+function getIsolatedMapModel(pair = getImagePairEl()) {
+    const maxRow = getAxisMaxValue(pair, 'row');
+    if (maxRow !== '0' && maxRow !== '1') {
+        return null;
+    }
+    const id = imageConfig[currentCategory]?.rows?.[Number(maxRow)]?.id;
+    return id === 'icon' || id === 'gfs' ? id : null;
+}
+
+function rowIndexForMapModel(modelId) {
+    const want = (String(modelId || '').toLowerCase().includes('icon')) ? 'icon' : 'gfs';
+    const rows = imageConfig[currentCategory]?.rows || [];
+    const index = rows.findIndex((row) => row.id === want);
+    return index >= 0 ? index : null;
+}
+
+/**
+ * When a model row is already isolated, switch isolation to match the profile model.
+ * No-op if both rows are visible — profile toggle must not change the map table then.
+ */
+function syncIsolatedMapModel(modelId) {
+    if (!getIsolatedMapModel()) {
+        return false;
+    }
+    const index = rowIndexForMapModel(modelId);
+    if (index == null) {
+        return false;
+    }
+    const current = getAxisMaxValue(getImagePairEl(), 'row');
+    if (current === String(index)) {
+        return false;
+    }
+    setAxisMaximize('row', String(index), { notify: true, syncSounding: false });
+    return true;
+}
+
+function syncSoundingModelFromIsolatedRow() {
+    const model = getIsolatedMapModel();
+    if (!model) {
+        return;
+    }
+    window.SoundingViewer?.setSelectedModel?.(model, {
+        reload: Boolean(window.SoundingViewer?.isOpen?.()),
+        syncMapIfIsolated: false,
+    });
+}
+
 function syncAxisMaximizeButtons() {
     const pair = getImagePairEl();
     const config = imageConfig[currentCategory];
@@ -723,7 +771,7 @@ function syncAxisMaximizeButtons() {
     }
 }
 
-function setAxisMaximize(axis, value, { notify = true } = {}) {
+function setAxisMaximize(axis, value, { notify = true, syncSounding = true } = {}) {
     const pair = getImagePairEl();
     if (!pair || (axis !== 'col' && axis !== 'row')) {
         return;
@@ -747,6 +795,10 @@ function setAxisMaximize(axis, value, { notify = true } = {}) {
     syncAxisMaximizeButtons();
     if (notify) {
         notifyMapLayoutChanged();
+    }
+    // Isolating a model row drives the profile toggle; clearing isolation leaves profile alone.
+    if (syncSounding && axis === 'row' && next) {
+        syncSoundingModelFromIsolatedRow();
     }
 }
 
@@ -1380,10 +1432,10 @@ function loadLegendPreferences() {
     try {
         const raw = localStorage.getItem(LEGEND_PREFS_KEY);
         if (raw) {
-            const parsed = JSON.parse(raw);
-            hiddenLegendFields = parsed?.hiddenFields && typeof parsed.hiddenFields === 'object'
-                ? parsed.hiddenFields
-                : {};
+        const parsed = JSON.parse(raw);
+        hiddenLegendFields = parsed?.hiddenFields && typeof parsed.hiddenFields === 'object'
+            ? parsed.hiddenFields
+            : {};
             policyLayerOrder = normalizePolicyLayerOrder(parsed?.policyLayerOrder);
             const storedVersion = Number(parsed?.policyHiddenDefaultsVersion);
             policyHiddenDefaultsVersion = Number.isFinite(storedVersion) ? storedVersion : 0;
@@ -1903,6 +1955,66 @@ function updateCurrentTimestepDisplay(framePair = null) {
     currentFrameTimeLabel.textContent = formatDateForRangeDisplay(getValidDateForFramePair(framePair));
 }
 
+function notifySelectedRangeChanged() {
+    window.SoundingViewer?.syncTafTimePresets?.();
+    window.SoundingViewer?.refreshTafDraft?.();
+}
+
+/** Clock-span hours between selected range start and end (matches TAF header span). */
+function getSelectedRangeDurationHours() {
+    const range = getSelectedRangeFrameInfo();
+    if (!range?.frames?.length) {
+        return null;
+    }
+    if (range.frames.length === 1) {
+        return 0;
+    }
+    const startMs = range.frames[0].validTime.getTime();
+    const endMs = range.frames[range.frames.length - 1].validTime.getTime();
+    return Math.round((endMs - startMs) / (60 * 60 * 1000));
+}
+
+/**
+ * Keep range start fixed; set end so validity spans the requested hours
+ * (e.g. 12 → 0708/0720 when start is 08Z).
+ */
+function setSelectedRangeDurationHours(hours) {
+    const durationHours = Number(hours);
+    if (!Number.isFinite(durationHours) || durationHours <= 0) {
+        return false;
+    }
+    const framePairs = getCurrentFramePairs();
+    if (!framePairs.length) {
+        return false;
+    }
+    const startPair = framePairs[selectedRangeStart - 1];
+    const startTime = getValidDateForFramePair(startPair);
+    if (!(startTime instanceof Date) || Number.isNaN(startTime.getTime())) {
+        return false;
+    }
+    const targetMs = startTime.getTime() + (durationHours * 60 * 60 * 1000);
+    let bestIndex = selectedRangeStart;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (let index = selectedRangeStart; index <= framePairs.length; index += 1) {
+        const validTime = getValidDateForFramePair(framePairs[index - 1]);
+        if (!(validTime instanceof Date) || Number.isNaN(validTime.getTime())) {
+            continue;
+        }
+        const dist = Math.abs(validTime.getTime() - targetMs);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestIndex = index;
+        }
+        // Prefer the first frame at/after the target when distances tie near the end.
+        if (validTime.getTime() >= targetMs && dist <= bestDist) {
+            bestIndex = index;
+            break;
+        }
+    }
+    updateRangeEndValue(bestIndex);
+    return true;
+}
+
 function updateRangeStartValue(value) {
     selectedRangeStart = Math.max(1, Math.min(value, selectedRangeEnd));
     frameRangeStartSlider.value = selectedRangeStart;
@@ -1911,6 +2023,7 @@ function updateRangeStartValue(value) {
     updateSelectedRangeHighlight();
     updateRangeTimeDisplay();
     updateImages();
+    notifySelectedRangeChanged();
 }
 
 function updateRangeEndValue(value) {
@@ -1921,6 +2034,7 @@ function updateRangeEndValue(value) {
     updateSelectedRangeHighlight();
     updateRangeTimeDisplay();
     updateImages();
+    notifySelectedRangeChanged();
 }
 
 function initializeElements() {
@@ -2547,7 +2661,7 @@ async function loadPolicyStack(model) {
     if (policyStackPromises[model]) {
         return policyStackPromises[model];
     }
-    const metaUrl = frameManifest?.policy?.[model];
+    const metaUrl = frameManifest?.policy?.[model] || `images/policy/${model}.json`;
     if (!metaUrl) {
         return null;
     }
@@ -2579,6 +2693,81 @@ async function ensurePolicyStacks() {
     }
     await loadFrameManifest();
     await Promise.all([loadPolicyStack('gfs'), loadPolicyStack('icon')]);
+}
+
+async function ensurePolicyStacksForSampling() {
+    await loadFrameManifest();
+    return Promise.all([loadPolicyStack('gfs'), loadPolicyStack('icon')]);
+}
+
+function samplePolicyStackAt(stack, lat, lon, hours) {
+    if (!stack || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+        return null;
+    }
+    const col = Math.round((lon - stack.lon0) / stack.dlon);
+    const row = Math.round((lat - stack.lat0) / stack.dlat);
+    if (col < 0 || col >= stack.nlon || row < 0 || row >= stack.nlat) {
+        return null;
+    }
+    const cell = row * stack.nlon + col;
+    const hourIndex = new Map(stack.hours.map((hour, index) => [Number(hour), index]));
+    const requestedHours = (hours || []).map((hour) => Number(hour)).filter(Number.isFinite);
+    const byHour = {};
+    requestedHours.forEach((hour) => {
+        const planeIndex = hourIndex.get(hour);
+        const sample = {};
+        Object.entries(stack.layers || {}).forEach(([layerId, layer]) => {
+            const plane = planeIndex == null ? null : layer.planes?.[planeIndex];
+            const value = plane ? plane[cell] : Number.NaN;
+            sample[layerId] = Number.isFinite(value) ? value : null;
+        });
+        byHour[hour] = sample;
+    });
+    return {
+        hours: requestedHours,
+        byHour,
+        lat0: stack.lat0,
+        lon0: stack.lon0,
+        dlat: stack.dlat,
+        dlon: stack.dlon,
+    };
+}
+
+async function samplePolicyAt(lat, lon, model, hours) {
+    const key = model === 'icon' ? 'icon' : 'gfs';
+    await ensurePolicyStacksForSampling();
+    const stack = policyStacks[key];
+    if (!stack) {
+        return null;
+    }
+    return samplePolicyStackAt(stack, lat, lon, hours);
+}
+
+function getSelectedRangeFrameInfo() {
+    const framePairs = getCurrentFramePairs();
+    const frames = [];
+    for (let index = selectedRangeStart; index <= selectedRangeEnd; index += 1) {
+        const framePair = framePairs[index - 1];
+        if (!framePair) {
+            continue;
+        }
+        const hour = Number(framePair.hour);
+        const validTime = getValidDateForFramePair(framePair);
+        if (!Number.isFinite(hour) || !(validTime instanceof Date) || Number.isNaN(validTime.getTime())) {
+            continue;
+        }
+        frames.push({
+            frameIndex: index,
+            hour,
+            validTime,
+            validTimeIso: validTime.toISOString(),
+        });
+    }
+    return {
+        startFrame: selectedRangeStart,
+        endFrame: selectedRangeEnd,
+        frames,
+    };
 }
 
 function getSelectedForecastHours() {
@@ -2842,6 +3031,127 @@ function getPolicyPeriodWindows(initDate) {
     ];
 }
 
+/** Model-cycle family for validity-relative TAF start grids. */
+function getModelCycleFamily(initDate = getPolicyRunInitDate()) {
+    const hour = initDate instanceof Date && !Number.isNaN(initDate.getTime())
+        ? initDate.getUTCHours()
+        : 0;
+    return (hour === 6 || hour === 18) ? '06_18' : '00_12';
+}
+
+/**
+ * TAF start options for every available UTC hour from the frame list.
+ * Keyed by model-relative forecast hour so setSelectedRangeStartHour works.
+ */
+function getTafStartHourOptions(initDate = getPolicyRunInitDate()) {
+    void initDate;
+    const framePairs = getCurrentFramePairs();
+    if (!framePairs.length) {
+        return [];
+    }
+    const durationHours = getSelectedRangeDurationHours();
+    const minSpan = Number.isFinite(durationHours) && durationHours > 0 ? durationHours : 12;
+    const options = [];
+    const seenForecastHours = new Set();
+    framePairs.forEach((pair, index) => {
+        const frameHour = Number(pair?.hour);
+        const validTime = getValidDateForFramePair(pair);
+        if (!Number.isFinite(frameHour) || !(validTime instanceof Date) || Number.isNaN(validTime.getTime())) {
+            return;
+        }
+        if (seenForecastHours.has(frameHour)) {
+            return;
+        }
+        seenForecastHours.add(frameHour);
+        const startIndex = index + 1;
+        const endIndex = frameIndexForHour(frameHour + Math.min(minSpan, 12), 'end');
+        const enabled = Boolean(endIndex && endIndex >= startIndex);
+        const label = formatPolicyDdhh(validTime) || `+${frameHour}`;
+        options.push({
+            hour: frameHour,
+            frameHour,
+            startIndex,
+            enabled,
+            label,
+            title: `Start ${label}Z (+${frameHour}h)`,
+        });
+    });
+    return options;
+}
+
+function getSelectedRangeStartHour() {
+    const framePairs = getCurrentFramePairs();
+    const pair = framePairs[selectedRangeStart - 1];
+    const hour = Number(pair?.hour);
+    return Number.isFinite(hour) ? hour : null;
+}
+
+/**
+ * Move the selected range start to a model-relative forecast hour and keep the
+ * current TAF duration (end is re-anchored from the new start).
+ * Pass { notify: false } while scrubbing the TAF start slider.
+ */
+function setSelectedRangeStartHour(startHour, { notify = true } = {}) {
+    const targetHour = Number(startHour);
+    if (!Number.isFinite(targetHour)) {
+        return false;
+    }
+    const startIndex = frameIndexForHour(targetHour, 'start');
+    if (!startIndex) {
+        return false;
+    }
+    const durationHours = getSelectedRangeDurationHours();
+    selectedRangeStart = startIndex;
+    if (selectedRangeEnd < selectedRangeStart) {
+        selectedRangeEnd = selectedRangeStart;
+    }
+    if (frameRangeStartSlider) {
+        frameRangeStartSlider.value = selectedRangeStart;
+    }
+    if (Number.isFinite(durationHours) && durationHours > 0) {
+        const framePairs = getCurrentFramePairs();
+        const startPair = framePairs[selectedRangeStart - 1];
+        const startTime = getValidDateForFramePair(startPair);
+        if (startTime instanceof Date && !Number.isNaN(startTime.getTime())) {
+            const targetMs = startTime.getTime() + (durationHours * 60 * 60 * 1000);
+            let bestIndex = selectedRangeStart;
+            let bestDist = Number.POSITIVE_INFINITY;
+            for (let index = selectedRangeStart; index <= framePairs.length; index += 1) {
+                const validTime = getValidDateForFramePair(framePairs[index - 1]);
+                if (!(validTime instanceof Date) || Number.isNaN(validTime.getTime())) {
+                    continue;
+                }
+                const dist = Math.abs(validTime.getTime() - targetMs);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestIndex = index;
+                }
+                if (validTime.getTime() >= targetMs && dist <= bestDist) {
+                    bestIndex = index;
+                    break;
+                }
+            }
+            selectedRangeEnd = Math.min(maxFrames, Math.max(bestIndex, selectedRangeStart));
+            if (frameRangeEndSlider) {
+                frameRangeEndSlider.value = selectedRangeEnd;
+            }
+        }
+    }
+    currentFrame = clampFrameToSelectedRange(currentFrame);
+    if (frameSlider) {
+        frameSlider.value = currentFrame;
+    }
+    updateSelectedRangeHighlight();
+    updateRangeTimeDisplay();
+    updateImages();
+    if (notify) {
+        notifySelectedRangeChanged();
+    } else {
+        window.SoundingViewer?.syncTafStartPresets?.();
+    }
+    return true;
+}
+
 function updatePolicyPresetLabels() {
     const initDate = getPolicyRunInitDate();
     const windows = getPolicyPeriodWindows(initDate);
@@ -2865,6 +3175,7 @@ function updatePolicyPresetLabels() {
         button.title = `+${window.startHour} to +${window.endHour}`;
     });
     syncPolicyPresetActiveState();
+    window.SoundingViewer?.syncTafTimePresets?.();
 }
 
 function applyPolicyPreset(startHour, endHour) {
@@ -2882,6 +3193,7 @@ function applyPolicyPreset(startHour, endHour) {
     updateSelectedRangeHighlight();
     updateRangeTimeDisplay();
     updateImages();
+    notifySelectedRangeChanged();
 }
 
 function syncPolicyPresetActiveState() {
@@ -3858,8 +4170,7 @@ function setupEventListeners() {
     document.addEventListener('keydown', function(event) {
         const target = event.target;
         const tagName = target?.tagName?.toLowerCase();
-        const isProfileSelect = target?.id === 'sounding-location-select'
-            || target?.id === 'sounding-model-select';
+        const isProfileSelect = target?.id === 'sounding-location-select';
         // Profile selects stay focused after a choice and swallow letter keys.
         // Release them so map / tool shortcuts work without an extra click.
         if (isProfileSelect) {
@@ -3886,13 +4197,14 @@ function setupEventListeners() {
 
         if (event.key.toLowerCase() === 't' && event.shiftKey) {
             window.SoundingViewer?.toggleTool?.('table');
-            event.preventDefault();
+                event.preventDefault();
             return;
         }
 
         const profileToolHotkeys = {
             s: 'sonde',
             h: 'hodograph',
+            y: 'taf',
         };
         const profileToolId = profileToolHotkeys[event.key.toLowerCase()];
         if (profileToolId && !event.shiftKey && window.SoundingViewer?.toggleTool) {
@@ -4022,6 +4334,18 @@ window.AnimationController = {
     getCurrentCategory: () => currentCategory,
     getCurrentDomain: () => currentDomain,
     getValidTime: () => getValidDateForFramePair(getCurrentFramePairs()[currentFrame - 1]),
+    getSelectedRange: () => getSelectedRangeFrameInfo(),
+    getSelectedRangeDurationHours,
+    setSelectedRangeDurationHours,
+    getTafStartHourOptions,
+    getSelectedRangeStartHour,
+    setSelectedRangeStartHour,
+    getModelCycleFamily,
+    getPolicyRunInitDate,
+    ensurePolicyStacks: ensurePolicyStacksForSampling,
+    samplePolicyAt,
     clearAxisMaximize,
+    getIsolatedMapModel,
+    syncIsolatedMapModel,
     isAnimationPlaying: () => isPlaying
 };
