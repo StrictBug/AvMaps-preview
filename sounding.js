@@ -931,10 +931,10 @@
         let response = null;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
             response = await fetch('https://api.open-meteo.com/v1/forecast', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body,
-            });
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body,
+        });
             if (response.ok || !isTransientHttpStatus(response.status) || attempt === maxAttempts) {
                 break;
             }

@@ -31,7 +31,7 @@
         meanMinBknFt: 500,
         meanLowStratusFewFt: 500,
         // Look ahead past TAF validity so upcoming FG/TSRA PROB still appears
-        // on shorter drafts (period text may extend past the header end).
+        // on shorter drafts (detection only — period end stays at validity).
         tafForesightHours: 12,
         visTsMm: 2.5,
         // TSRA visibility from CB base (ft AGL).
@@ -94,6 +94,9 @@
         fmMinHours: 3,
         // Mean FM/BECMG: new regime must hold this many hours before emitting.
         meanChangeMinHours: 2,
+        // Wind-only means (CAVOK veer / lull / pickup): require a longer hold so a
+        // 1–2 h dip does not lock the rest of the TAF (e.g. YAYE 19016 after a lull).
+        meanWindChangeMinHours: 4,
         // Optional wind-regime mean change (any speed).
         meanOptionalDirDeg: 60,
         // Optional cloud base jump (ft) above amendment ceilings.
@@ -129,6 +132,14 @@
         daytimeCloudTempoMinHours: 3,
         predawnHoursBeforeSunrise: 3,
         eveningHoursBeforeSunset: 2,
+        // Overnight shallow moist BL (mist/fog) vs invented SCT/BKN010 when
+        // 800–1500 ft is dry on the profile. OM fog weather codes → BR/FG assist.
+        overnightShallowLclMaxFt: 1000,
+        overnightShallowSurfaceRh: 85,
+        profileCloudSupportRh: 85,
+        profileCloudSupportMaxSpreadC: 2.0,
+        profileCloudSupportTolFt: 700,
+        omFogWeatherCodes: [45, 48, 49],
         // Line-count resistance: soft target, then ramp; hard avoid beyond soft cap.
         // Longer validity → higher budget / slower ramp (ref = 24 h TAF).
         tafSoftLineTarget: 4,
@@ -167,6 +178,12 @@
         cloudBaseLevelsHpa: [1000, 975, 950, 925, 900, 850],
         cloudBaseMinRh: 95,
         cloudBaseMaxSpreadC: 0.5,
+        // CB base only: mid-level moist deck (dry BL / high-based TS). Soft RH so
+        // marginal 700 hPa decks (~RH 90–94) still count. Fog/stratus ladder untouched.
+        cbCloudBaseLevelsHpa: [1000, 975, 950, 925, 900, 850, 800, 700, 600],
+        cbCloudBaseMinRh: 90,
+        cbCloudBaseMaxSpreadC: 1.0,
+        cbCloudBaseMinAglFt: 1500,
         // Mean / FM line: never publish restricted vis — TEMPO/PROB carry cuts.
         meanVisM: 9999,
         // Precip intensity prefixes (-RA / RA / +RA) from amount.
@@ -287,6 +304,45 @@
     }
 
     /**
+     * Cover for mean BKN gates: OM/Policy low cloud, plus near-saturated profile
+     * decks around 1000–2500 ft (traces often show BKN when low_cloud_cover is soft).
+     */
+    function effectiveLowCloudCover(hour, baseFt = null) {
+        let cover = lowCloudCoverRh(hour);
+        const bknRh = THRESHOLDS.bknRh || 90;
+        if (cover >= bknRh) {
+            return cover;
+        }
+        const samples = hour?.profileLevelSamples;
+        if (Array.isArray(samples)) {
+            samples.forEach((sample) => {
+                if (!Number.isFinite(sample?.aglFt)) {
+                    return;
+                }
+                if (sample.aglFt < 800 || sample.aglFt > 2500) {
+                    return;
+                }
+                const moist = (Number.isFinite(sample.rh) && sample.rh >= bknRh)
+                    || (Number.isFinite(sample.spread) && sample.spread <= 1.0);
+                if (moist) {
+                    cover = Math.max(cover, bknRh);
+                }
+            });
+        }
+        if (
+            cover < bknRh
+            && Number.isFinite(baseFt)
+            && profileSupportsCloudBaseFt(hour, baseFt, {
+                minRh: bknRh,
+                maxSpreadC: 1.0,
+            }) === true
+        ) {
+            cover = Math.max(cover, bknRh);
+        }
+        return cover;
+    }
+
+    /**
      * Dry low cloud may promote FEW/SCT → BKN only when cover supports broken
      * (or fog/precip owns the holding). Marginal moist edges stay SCT/FEW.
      */
@@ -309,7 +365,7 @@
         if (hasDrizzleSignal(hour) || meaningfulWetPrecip(hour)) {
             return true;
         }
-        return lowCloudCoverRh(hour) >= (THRESHOLDS.bknRh || 90);
+        return effectiveLowCloudCover(hour) >= (THRESHOLDS.bknRh || 90);
     }
 
     /**
@@ -451,6 +507,85 @@
         });
     }
 
+    /** WMO fog/depositing-rime fog codes from Open-Meteo weather_code. */
+    function omFogWeather(hour) {
+        const code = hour?.omWeatherCode;
+        return (THRESHOLDS.omFogWeatherCodes || [45, 48, 49]).includes(code);
+    }
+
+    /**
+     * True when the OM pressure ladder is moist near a published cloud base.
+     * false = dry at that height; null = no nearby sample.
+     */
+    function profileSupportsCloudBaseFt(hour, baseFt, {
+        minRh = THRESHOLDS.profileCloudSupportRh || 85,
+        maxSpreadC = THRESHOLDS.profileCloudSupportMaxSpreadC || 2.0,
+        tolFt = THRESHOLDS.profileCloudSupportTolFt || 700,
+    } = {}) {
+        if (!Number.isFinite(baseFt)) {
+            return null;
+        }
+        const samples = hour?.profileLevelSamples;
+        if (!Array.isArray(samples) || !samples.length) {
+            return null;
+        }
+        let best = null;
+        let bestDist = Infinity;
+        samples.forEach((sample) => {
+            if (!Number.isFinite(sample?.aglFt)) {
+                return;
+            }
+            const dist = Math.abs(sample.aglFt - baseFt);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = sample;
+            }
+        });
+        if (!best || bestDist > tolFt) {
+            return null;
+        }
+        const spreadOk = Number.isFinite(best.spread) && best.spread <= maxSpreadC;
+        const rhOk = Number.isFinite(best.rh) && best.rh >= minRh;
+        return spreadOk || rhOk;
+    }
+
+    /**
+     * Overnight mist / shallow moist BL: surface moist or OM fog, but no real
+     * cloud deck near 1000 ft (975/950 dry). Should be PROB BR, not SCT/BKN010.
+     */
+    function hourLooksLikeOvernightMist(hour) {
+        if (!isOvernightPhase(hour?.diurnalPhase)) {
+            return false;
+        }
+        if (
+            holdingHasPrecipStorm(hour)
+            || isPrecipStormCode(primaryPrecipCode(hour))
+        ) {
+            return false;
+        }
+        if (omFogWeather(hour)) {
+            return true;
+        }
+        const lclMax = THRESHOLDS.overnightShallowLclMaxFt || 1000;
+        const rhMin = THRESHOLDS.overnightShallowSurfaceRh || 85;
+        const lcl = Number.isFinite(hour?.lclFt) ? hour.lclFt : null;
+        const surfaceRh = Number.isFinite(hour?.surfaceRh) ? hour.surfaceRh : null;
+        const surfaceMoist = (Number.isFinite(lcl) && lcl <= lclMax)
+            || (Number.isFinite(surfaceRh) && surfaceRh >= rhMin);
+        if (!surfaceMoist) {
+            return false;
+        }
+        const midSupported = profileSupportsCloudBaseFt(hour, 1000);
+        if (midSupported === true) {
+            return false;
+        }
+        if (midSupported === false) {
+            return true;
+        }
+        // No mid-level sample: still treat low overnight LCL as mist-class.
+        return Number.isFinite(lcl) && lcl <= 800;
+    }
+
     /** Near-surface moist deck / LCL — fog & lifted stratus, not a distinct mean BKN layer. */
     function meanHasShallowMoistDeck(hour) {
         // Precip_storm owns low BKN/SCT (e.g. -SHRA SCT004 BKN006) — not fog PROB.
@@ -464,13 +599,24 @@
         const profile = Number.isFinite(hour?.profileCloudBaseFt) ? hour.profileCloudBaseFt : null;
         const omBase = Number.isFinite(hour?.omCloudBaseFt) ? hour.omCloudBaseFt : null;
         const refDeck = Number.isFinite(profile) ? profile : omBase;
-        if (fogPolicyCategory(hour) >= 1 || hourHasFog(hour)) {
+        if (fogPolicyCategory(hour) >= 1 || hourHasFog(hour) || hourLooksLikeOvernightMist(hour)) {
             return true;
         }
         if (Number.isFinite(lcl) && lcl < 500) {
             return true;
         }
         if (Number.isFinite(refDeck) && refDeck < 500) {
+            return true;
+        }
+        // Overnight: LCL/ref ≤1000 with dry ~010 deck is shallow mist, not SCT010.
+        if (
+            isOvernightPhase(hour?.diurnalPhase)
+            && (
+                (Number.isFinite(lcl) && lcl <= (THRESHOLDS.overnightShallowLclMaxFt || 1000))
+                || (Number.isFinite(refDeck) && refDeck <= (THRESHOLDS.overnightShallowLclMaxFt || 1000))
+            )
+            && profileSupportsCloudBaseFt(hour, 1000) !== true
+        ) {
             return true;
         }
         return false;
@@ -532,7 +678,7 @@
         const profile = Number.isFinite(hour?.profileCloudBaseFt) ? hour.profileCloudBaseFt : null;
         const omBase = Number.isFinite(hour?.omCloudBaseFt) ? hour.omCloudBaseFt : null;
         const refDeck = Number.isFinite(profile) ? profile : omBase;
-        const cover = lowCloudCoverRh(hour);
+        const cover = effectiveLowCloudCover(hour, cloud.baseFt);
         const shallow = meanHasShallowMoistDeck(hour);
 
         // Mean BKN needs broken-strength cover (marginal edges stay SCT/NSC).
@@ -670,13 +816,22 @@
             bracketMeanClouds(hour.clouds || [], { lift: liftClouds }),
             hour,
         );
-        // Soft-demote mean BKN when cover is only SCT-strength, then drop unjustified layers.
+        // Promote/demote mean BKN using effective cover (OM low cloud + profile moist deck).
+        const bknRh = THRESHOLDS.bknRh || 90;
         clouds = clouds.map((cloud) => {
+            if (cloud.convective === 'CB') {
+                return cloud;
+            }
+            const cover = effectiveLowCloudCover(hour, cloud.baseFt);
             if (
-                cloud.amount === 'BKN'
-                && cloud.convective !== 'CB'
-                && lowCloudCoverRh(hour) < (THRESHOLDS.bknRh || 90)
+                (cloud.amount === 'SCT' || cloud.amount === 'BKN')
+                && Number.isFinite(cloud.baseFt)
+                && cloud.baseFt < (THRESHOLDS.cavokCloudFt || 5000)
+                && cover >= bknRh
             ) {
+                return { ...cloud, amount: 'BKN' };
+            }
+            if (cloud.amount === 'BKN' && cover < bknRh) {
                 return { ...cloud, amount: 'SCT' };
             }
             return cloud;
@@ -850,8 +1005,68 @@
         return false;
     }
 
+    /**
+     * True when prev→next is only a wind story (same CAVOK/wx/ceiling body).
+     * Used to demand a longer hold than cloud/precip regime changes.
+     */
+    function isWindOnlyMeanChange(prev, next) {
+        if (!prev || !next || !classifyMeanChange(prev, next)) {
+            return false;
+        }
+        return meanBodyKey(prev) === meanBodyKey(next);
+    }
+
+    /** New wind regime still "holds" — speed within ladder step, dir within optional band. */
+    function windRegimeHolds(rep, hour) {
+        if (!rep || !hour) {
+            return false;
+        }
+        const repKt = publishedWindKt(rep);
+        const hourKt = publishedWindKt(hour);
+        if (Math.abs(repKt - hourKt) >= (THRESHOLDS.windChangeKt || 10)) {
+            return false;
+        }
+        // Light / VRB winds wander in direction — speed band alone is enough.
+        const vrbMax = Math.max(THRESHOLDS.windVrbMaxKt || 4, 8);
+        if (repKt <= vrbMax && hourKt <= vrbMax) {
+            return true;
+        }
+        return angularDiff(rep.windDir, hour.windDir) < (THRESHOLDS.meanOptionalDirDeg || 60);
+    }
+
+    /**
+     * Representative mean for a segment. For CAVOK/wind-only slices, use the
+     * median-speed hour (vector-blend near-median) so a brief lull does not
+     * become the published wind for a long breezy overnight stretch.
+     */
     function meanSegmentRepresentative(means, start, end) {
         const slice = means.slice(start, end + 1);
+        if (!slice.length) {
+            return null;
+        }
+        const body = meanBodyKey(slice[0]);
+        const sameBody = slice.every((hour) => meanBodyKey(hour) === body);
+        if (sameBody && (body === 'CAVOK' || slice.length >= 3)) {
+            const ranked = slice
+                .map((hour, index) => ({ hour, index, kt: publishedWindKt(hour) }))
+                .sort((a, b) => a.kt - b.kt || a.index - b.index);
+            const median = ranked[Math.floor(ranked.length / 2)];
+            const band = THRESHOLDS.windChangeKt || 10;
+            const near = ranked.filter((entry) => Math.abs(entry.kt - median.kt) < band);
+            const pool = (near.length ? near : ranked).map((entry) => entry.hour);
+            let blended = pool[0];
+            for (let index = 1; index < pool.length; index += 1) {
+                blended = blendMeanWindStates(blended, pool[index]);
+            }
+            // Keep non-wind body from dominant (wx/cloud), wind from the blend.
+            const bodyRep = normalizeMeanState(dominantState(slice) || slice[0], { liftClouds: false });
+            return normalizeMeanState({
+                ...bodyRep,
+                windKt: blended.windKt,
+                windDir: blended.windDir,
+                gustKt: blended.gustKt,
+            }, { liftClouds: false });
+        }
         return normalizeMeanState(dominantState(slice) || slice[0], { liftClouds: false });
     }
 
@@ -939,12 +1154,16 @@
                 out.push({ ...group, state: group.state ? { ...group.state } : group.state });
                 return;
             }
+            const dirDelta = angularDiff(prev?.state?.windDir, group?.state?.windDir);
+            const mandatoryWindDir = dirDelta > (THRESHOLDS.windChangeDeg || 30)
+                && (windAmendmentCapable(prev?.state) || windAmendmentCapable(group?.state));
             if (
                 prev
                 && isMeanChangeGroup(prev)
                 && isMeanChangeGroup(group)
                 && meanBodyKey(prev.state) === meanBodyKey(group.state)
-                && angularDiff(prev.state.windDir, group.state.windDir) < maxAbsorbDir
+                && dirDelta < maxAbsorbDir
+                && !mandatoryWindDir
                 // Don't absorb a real wind-speed regime change (e.g. 06→15 kt pickup).
                 && Math.abs(publishedWindKt(prev.state) - publishedWindKt(group.state))
                     < (THRESHOLDS.windChangeKt || 10)
@@ -1577,13 +1796,17 @@
         const out = [];
         sorted.forEach((group) => {
             const prev = out[out.length - 1];
+            const dirDelta = angularDiff(prev?.state?.windDir, group?.state?.windDir);
+            const mandatoryWindDir = dirDelta > (THRESHOLDS.windChangeDeg || 30)
+                && (windAmendmentCapable(prev?.state) || windAmendmentCapable(group?.state));
             if (
                 prev
                 && isMeanChangeGroup(prev)
                 && isMeanChangeGroup(group)
                 && prev.state?.cavok
                 && group.state?.cavok
-                && angularDiff(prev.state.windDir, group.state.windDir) < (THRESHOLDS.meanOptionalDirDeg || 60)
+                && dirDelta < (THRESHOLDS.meanOptionalDirDeg || 60)
+                && !mandatoryWindDir
                 && Math.abs(publishedWindKt(prev.state) - publishedWindKt(group.state))
                     < (THRESHOLDS.windChangeKt || 10)
             ) {
@@ -1611,12 +1834,13 @@
                 out.push(group);
                 return;
             }
-            // Holding onset / transition / cessation are definitive regime edges —
-            // never drop as "insignificant" (line pressure does not remove these either).
+            // Holding onset / transition / cessation / fog-abut are definitive regime
+            // edges — never drop as "insignificant".
             if (
                 group.meanSource === 'holding-onset'
                 || group.meanSource === 'holding-transition'
                 || group.meanSource === 'holding-cessation'
+                || group.meanSource === 'fog-prob-abut'
             ) {
                 const held = {
                     ...group,
@@ -1663,6 +1887,98 @@
             best = best == null ? ft : Math.max(best, ft);
         });
         return Number.isFinite(best) ? snapCloudBaseFt(best) : null;
+    }
+
+    function isFogOrBrProbGroup(group) {
+        if (!group || (group.kind !== 'PROB30' && group.kind !== 'PROB40')) {
+            return false;
+        }
+        if (group.bareProb) {
+            return true;
+        }
+        if (hourHasFog(group.state) || fogPolicyCategory(group.state) >= 1) {
+            return true;
+        }
+        return (group.state?.weather || []).some((code) => (
+            code === 'FG' || code === 'FZFG' || code === 'BR'
+        ));
+    }
+
+    function meanHasAlternateLowCloud(state) {
+        if (!state) {
+            return false;
+        }
+        if (Number.isFinite(meanSignificantCloudBaseFt(state))) {
+            return true;
+        }
+        if (Number.isFinite(meanScatteredBaseFt(state))) {
+            return true;
+        }
+        return (state.clouds || []).some((cloud) => (
+            cloud.convective !== 'CB'
+            && ['FEW', 'SCT', 'BKN', 'OVC'].includes(cloud.amount)
+            && Number.isFinite(cloud.baseFt)
+            && cloud.baseFt < (THRESHOLDS.cavokCloudFt || 5000)
+        ));
+    }
+
+    /**
+     * After fog/BR PROB ends, a cloudy mean must not leave a long CAVOK hole.
+     * Convert late FM into BECMG whose window ends at the FM time and starts at
+     * max(PROB end, FM − becmgHours):
+     *   PROB …/0919 + FM092000 → BECMG 0919/0920
+     *   PROB …/0919 + FM092200 → BECMG 0920/0922
+     */
+    function abutMeanCloudAfterFogProb(groups, base) {
+        const riskyGap = Math.max(1, THRESHOLDS.tempoRiskyGapHours || 1);
+        const meanHold = Math.max(1, THRESHOLDS.meanChangeMinHours || 2);
+        // Allow clear gap up to mean-hold + risky hour (FM delayed by regime hold).
+        const maxGapH = Math.max(riskyGap, meanHold + riskyGap);
+        const becmgHours = Math.max(1, Math.min(2, THRESHOLDS.becmgHours || 2));
+        const hourMs = 60 * 60 * 1000;
+        const fogHoldings = (groups || []).filter(isFogOrBrProbGroup);
+        if (!fogHoldings.length) {
+            return groups;
+        }
+        (groups || []).forEach((mean) => {
+            if (!isMeanChangeGroup(mean) || !Number.isFinite(mean?.startMs)) {
+                return;
+            }
+            if (!meanHasAlternateLowCloud(mean.state)) {
+                return;
+            }
+            let bestFog = null;
+            let bestGapH = Infinity;
+            fogHoldings.forEach((fog) => {
+                const fogEnd = fog.endExclusiveMs;
+                if (!Number.isFinite(fogEnd) || mean.startMs <= fogEnd) {
+                    return;
+                }
+                const gapH = (mean.startMs - fogEnd) / hourMs;
+                if (gapH <= 0 || gapH > maxGapH + 1e-6) {
+                    return;
+                }
+                if (gapH < bestGapH) {
+                    bestGapH = gapH;
+                    bestFog = fog;
+                }
+            });
+            if (!bestFog) {
+                return;
+            }
+            const fogEnd = bestFog.endExclusiveMs;
+            const originalStart = mean.startMs;
+            mean.kind = 'BECMG';
+            mean.endExclusiveMs = originalStart;
+            mean.startMs = Math.max(fogEnd, originalStart - (becmgHours * hourMs));
+            mean.sortKey = mean.startMs;
+            mean.meanSource = 'fog-prob-abut';
+            mean.meanPriority = mean.meanPriority || 'mandatory';
+            if (base) {
+                mean.text = renderGroupText(mean, base);
+            }
+        });
+        return groups;
     }
 
     /**
@@ -1955,7 +2271,11 @@
             return [];
         }
         const means = publishedHours.map((hour) => normalizeMeanState(hour, { liftClouds: false }));
-        const minHours = Math.max(1, THRESHOLDS.meanChangeMinHours || 2);
+        const minHoursDefault = Math.max(1, THRESHOLDS.meanChangeMinHours || 2);
+        const minHoursWind = Math.max(
+            minHoursDefault,
+            THRESHOLDS.meanWindChangeMinHours || 4,
+        );
         const breaks = [];
         let segRep = means[0];
         let segStart = 0;
@@ -1964,7 +2284,9 @@
             if (!changeKind) {
                 continue;
             }
-            // Require the new regime to hold for meanChangeMinHours (or to end).
+            const windOnly = isWindOnlyMeanChange(segRep, means[index]);
+            const minHours = windOnly ? minHoursWind : minHoursDefault;
+            // Require the new regime to hold for minHours (or to end).
             const lookEnd = Math.min(means.length - 1, index + minHours - 1);
             let held = 0;
             for (let look = index; look <= lookEnd; look += 1) {
@@ -1977,10 +2299,15 @@
                 continue;
             }
             // Prefer comparing against the new hour's own continuity.
+            // Wind-only: use speed/dir band (not classifyMeanChange) so a progressive
+            // veer does not look "unstable" while a 2 h lull before rebound does.
             const newRep = means[index];
             let stableNew = 1;
             for (let look = index + 1; look < means.length && look < index + minHours; look += 1) {
-                if (!classifyMeanChange(newRep, means[look])) {
+                const holds = windOnly
+                    ? windRegimeHolds(newRep, means[look])
+                    : !classifyMeanChange(newRep, means[look]);
+                if (holds) {
                     stableNew += 1;
                 } else {
                     break;
@@ -2683,17 +3010,33 @@
     }
 
     /**
+     * CB base AGL: prefer elevated mid-level moist deck when at/above surface LCL
+     * (high-based / dry BL). Otherwise surface LCL, then OM cloud_base.
+     */
+    function resolveCbBaseFt(hour) {
+        const lcl = Number.isFinite(hour?.lclFt) ? hour.lclFt : null;
+        const elevated = Number.isFinite(hour?.cbCloudBaseFt) ? hour.cbCloudBaseFt : null;
+        if (Number.isFinite(elevated) && (!Number.isFinite(lcl) || elevated >= lcl)) {
+            return Math.max(1000, elevated);
+        }
+        if (Number.isFinite(lcl)) {
+            return Math.max(1000, lcl);
+        }
+        if (Number.isFinite(hour?.omCloudBaseFt)) {
+            return Math.max(1000, hour.omCloudBaseFt);
+        }
+        return 3000;
+    }
+
+    /**
      * TSRA PROB lines always carry a CB group with a base (even if >5000 ft AGL).
+     * Recomputes CB height each call so hierarchy / high-based fixes stay current.
      */
     function ensureTsraCbClouds(hour) {
-        const clouds = (hour?.clouds || []).map((cloud) => ({ ...cloud }));
-        if (clouds.some((cloud) => cloud.convective === 'CB')) {
-            return clouds;
-        }
-        let cbBaseFt = Number.isFinite(hour?.lclFt)
-            ? Math.max(1000, hour.lclFt)
-            : (Number.isFinite(hour?.omCloudBaseFt) ? hour.omCloudBaseFt : 3000);
-        cbBaseFt = snapCloudBaseFt(cbBaseFt);
+        const clouds = (hour?.clouds || [])
+            .map((cloud) => ({ ...cloud }))
+            .filter((cloud) => cloud.convective !== 'CB');
+        let cbBaseFt = snapCloudBaseFt(resolveCbBaseFt(hour));
         const lowBase = clouds
             .map((cloud) => cloud.baseFt)
             .filter((base) => Number.isFinite(base));
@@ -2703,7 +3046,7 @@
                 cbBaseFt = snapCloudBaseFt(maxLow + 500);
             }
         }
-        // Prefer SCT for the CB layer when not already present as BKN/OVC CB.
+        // Prefer SCT for the CB layer.
         clouds.push({ amount: 'SCT', baseFt: cbBaseFt, convective: 'CB' });
         return clouds;
     }
@@ -2908,9 +3251,7 @@
             return fogTable[hour.freezingFogCat] || fogTable[2] || 1500;
         }
         if ((hour.tsMm || 0) >= THRESHOLDS.visTsMm || (hour.weather || []).includes('TSRA')) {
-            const cbBase = cbBaseFtFromClouds(hour.clouds)
-                || (Number.isFinite(hour.lclFt) ? Math.max(1000, hour.lclFt) : null)
-                || hour.omCloudBaseFt;
+            const cbBase = cbBaseFtFromClouds(hour.clouds) || resolveCbBaseFt(hour);
             return visibilityFromCbBaseFt(cbBase);
         }
         // Drizzle: depth / proximity — not precip amount.
@@ -2969,7 +3310,14 @@
      * F3 → FG; F1/F2 → BR (policy F2 is mist-class for draft PROB).
      */
     function fogProbRepresentativeCategory(slice) {
-        const cats = (slice || []).map(fogPolicyCategory);
+        const cats = (slice || []).map((hour) => {
+            const policy = fogPolicyCategory(hour);
+            if (policy >= 1) {
+                return policy;
+            }
+            // Overnight mist / OM fog without Policy still encodes as BR (cat 1).
+            return (omFogWeather(hour) || hourLooksLikeOvernightMist(hour)) ? 1 : 0;
+        });
         if (!cats.length) {
             return 0;
         }
@@ -3057,13 +3405,38 @@
         }
         const resolved = resolveCloudBaseFt(hour);
         const rawBaseFt = Number.isFinite(resolved) ? Math.max(100, resolved) : 2000;
-        return [{ amount, baseFt: snapCloudBaseFt(rawBaseFt) }];
+        const baseFt = snapCloudBaseFt(rawBaseFt);
+        // Do not invent SCT/BKN010 (etc.) when the profile is dry at that height —
+        // overnight shallow moist → PROB BR; daytime dry aloft → no low cloud group.
+        if (
+            baseFt <= 1500
+            && !holdingHasPrecipStorm(hour)
+            && !isPrecipStormCode(primaryPrecipCode(hour))
+            && profileSupportsCloudBaseFt(hour, baseFt) === false
+        ) {
+            return [];
+        }
+        if (hourLooksLikeOvernightMist(hour) || meanHasShallowMoistDeck(hour)) {
+            // Fog/BR PROB owns the shallow deck — mean/TEMPO stay clear here.
+            if (baseFt <= 1000) {
+                return [];
+            }
+        }
+        return [{ amount, baseFt }];
     }
 
     function enrichHourState(raw) {
-        const visM = visibilityFromState(raw);
-        const weather = weatherCodesFromState(raw, visM);
-        const clouds = cloudsFromState(raw);
+        // OM fog codes / overnight shallow moist → BR-class policy cat for PROB routing.
+        let hour = raw;
+        if (
+            fogPolicyCategory(hour) < 1
+            && (omFogWeather(hour) || hourLooksLikeOvernightMist(hour))
+        ) {
+            hour = { ...hour, fogCat: 1 };
+        }
+        const visM = visibilityFromState(hour);
+        const weather = weatherCodesFromState(hour, visM);
+        const clouds = cloudsFromState(hour);
         const hasSignificantCloud = clouds.some((cloud) => (
             (cloud.amount === 'BKN' || cloud.amount === 'OVC') && cloud.baseFt < THRESHOLDS.cavokCloudFt
         ));
@@ -3071,12 +3444,12 @@
             && weather.length === 0
             && !hasSignificantCloud;
         return {
-            ...raw,
+            ...hour,
             weather,
             clouds,
             visM,
             cavok,
-            windGroup: formatWindGroup(raw.windKt, raw.windDir, raw.gustKt),
+            windGroup: formatWindGroup(hour.windKt, hour.windDir, hour.gustKt),
         };
     }
 
@@ -4174,6 +4547,17 @@
         }
 
         stormProbs.forEach((group) => {
+            // High-based TSRA: CB only — no invented BKN015 under CAVOK means.
+            if (stormIsHighBased(group)) {
+                const withoutLow = (group.state?.clouds || [])
+                    .filter((cloud) => cloud.convective === 'CB');
+                group.state = {
+                    ...group.state,
+                    clouds: ensureTsraCbClouds({ ...group.state, clouds: withoutLow }),
+                    cavok: false,
+                };
+                return;
+            }
             const overlappingTempos = tempos.filter((tempo) => rangesOverlap(
                 group.startMs,
                 group.endExclusiveMs,
@@ -4281,8 +4665,6 @@
         validityEnd,
         useProb,
         forceProbTempo = false,
-        // When false, PROB period end may extend past TAF validity (foresight).
-        clampPeriodToValidity = true,
     }) {
         const hasStorm = slice.some(hourHasTs);
         const hasFog = sliceHasFog(slice);
@@ -4293,21 +4675,14 @@
         if (slice.length < THRESHOLDS.tempoMinHours) {
             return;
         }
-        const periodClamp = clampPeriodToValidity ? validityEnd : null;
+        // Period end always clamps to TAF validity; foresight only informs whether
+        // to emit the PROB and how severe the body is.
         const period = formatPeriod(
             slice[0].validTime,
             slice[slice.length - 1].validTime,
-            periodClamp,
+            validityEnd,
         );
         if (!period) {
-            return;
-        }
-        // Foresight PROB must still begin inside the published validity.
-        if (
-            !clampPeriodToValidity
-            && validityEnd instanceof Date
-            && period.startMs >= validityEnd.getTime()
-        ) {
             return;
         }
         const snapped = withTempoSnappedClouds(state);
@@ -5063,17 +5438,24 @@
             }
             const slice = hours.slice(start, run.end + 1);
             const worst = worstState(slice) || slice[0];
-            // Peak mean/gust / precip over the whole storm spell — not the worst-wx hour alone.
+            // Peak mean/gust / precip / CB deck over the whole storm spell.
             let peakPrecipMm = 0;
             let peakConvectiveMm = 0;
+            let peakCbCloudBaseFt = null;
             slice.forEach((hour) => {
                 peakPrecipMm = Math.max(peakPrecipMm, precipAmountMm(hour));
                 peakConvectiveMm = Math.max(peakConvectiveMm, convectivePrecipMm(hour));
+                if (Number.isFinite(hour?.cbCloudBaseFt)) {
+                    peakCbCloudBaseFt = peakCbCloudBaseFt == null
+                        ? hour.cbCloudBaseFt
+                        : Math.max(peakCbCloudBaseFt, hour.cbCloudBaseFt);
+                }
             });
             const state = {
                 ...peakWindHourFromSlice(slice, worst),
                 peakPrecipMm,
                 peakConvectiveMm,
+                cbCloudBaseFt: peakCbCloudBaseFt ?? worst?.cbCloudBaseFt ?? null,
             };
             pushTempoLikeGroup(groups, {
                 slice,
@@ -5083,25 +5465,32 @@
                 validityEnd,
                 useProb: true,
                 forceProbTempo: true,
-                clampPeriodToValidity: false,
             });
         });
     }
 
     /**
-     * Fog/mist PROB from policy fog hours (incl. foresight). Extends the start
-     * back through contiguous low-cloud lead-in so short TAFs still show the
-     * upcoming FG spell that a longer validity would publish.
+     * Fog/mist PROB from policy fog hours (incl. foresight for detection).
+     * Period end is always clamped to TAF validity.
      */
     function pushFogProbGroups(groups, hours, base, total, validityEnd) {
         const fogFlags = hours.map((hour) => (
-            hourHasFog(hour) || fogPolicyCategory(hour) >= 1
+            hourHasFog(hour)
+            || fogPolicyCategory(hour) >= 1
+            || omFogWeather(hour)
+            || hourLooksLikeOvernightMist(hour)
         ));
         contiguousRuns(fogFlags).forEach((run) => {
             let start = run.start;
             while (start > 0) {
                 const prev = hours[start - 1];
-                if (hourHasFog(prev) || fogPolicyCategory(prev) >= 1 || hourHasTs(prev)) {
+                if (
+                    hourHasFog(prev)
+                    || fogPolicyCategory(prev) >= 1
+                    || omFogWeather(prev)
+                    || hourLooksLikeOvernightMist(prev)
+                    || hourHasTs(prev)
+                ) {
                     break;
                 }
                 if (!tempoEligible(prev) || !tempoSignificantVsBase(base, prev)) {
@@ -5126,8 +5515,45 @@
                 total,
                 validityEnd,
                 useProb: true,
-                clampPeriodToValidity: false,
             });
+        });
+    }
+
+    /**
+     * TEMPO / PROB / BECMG must not publish past TAF validity (header end).
+     * Drops FM/BECMG/TEMPO/PROB that start at/after validity; clamps BECMG and
+     * holding period ends to validity.
+     */
+    function clampGroupsToValidity(groups, validityEnd, base) {
+        if (!(validityEnd instanceof Date) || Number.isNaN(validityEnd.getTime())) {
+            return groups;
+        }
+        const endMs = validityEnd.getTime();
+        return (groups || []).filter((group) => {
+            if (!group) {
+                return false;
+            }
+            const kind = String(group.kind || '');
+            const isHolding = kind === 'TEMPO' || kind.startsWith('PROB');
+            const isMean = isMeanChangeGroup(group);
+            if (!isHolding && !isMean) {
+                return true;
+            }
+            if (group.startMs >= endMs) {
+                return false;
+            }
+            if (group.endExclusiveMs > endMs) {
+                group.endExclusiveMs = endMs;
+                group.text = renderGroupText(group, base);
+            }
+            // BECMG needs a positive window; FM may have endExclusive === start.
+            if (kind === 'BECMG' && group.endExclusiveMs <= group.startMs) {
+                return false;
+            }
+            if (isHolding && group.endExclusiveMs <= group.startMs) {
+                return false;
+            }
+            return true;
         });
     }
 
@@ -5158,6 +5584,8 @@
                 && !hourHasTs(hour)
                 && !hourHasFog(hour)
                 && fogPolicyCategory(hour) < 1
+                && !omFogWeather(hour)
+                && !hourLooksLikeOvernightMist(hour)
             )),
             publishedHours,
             lat,
@@ -5179,7 +5607,6 @@
                 total,
                 validityEnd,
                 useProb: true,
-                clampPeriodToValidity: true,
             });
         });
 
@@ -5190,7 +5617,8 @@
             groups.push(group);
         });
 
-        // Fog / storm PROB use published + foresight hours; period may run past validity.
+        // Fog / storm PROB use published + foresight hours for detection; period
+        // text is clamped to TAF validity.
         pushFogProbGroups(groups, hours, base, hours.length, validityEnd);
         pushStormProbGroups(groups, hours, base, hours.length, validityEnd);
 
@@ -5350,6 +5778,8 @@
         reconciled = alignCavokMeanWithCloudTempos(reconciled);
         // Fog/BR PROB owns low stratus — drop overlapping mean BKN006-style ceilings.
         reconciled = stripMeanBknUnderFogHoldings(reconciled);
+        // Close risky 1 h gaps between BR/FG PROB end and the next cloudy mean.
+        reconciled = abutMeanCloudAfterFogProb(reconciled, base);
         // Compress can invent BECMGs — ensure no FM still starts inside a BECMG window.
         let meansFixed = resolveBecmgFmOverlaps(
             reconciled.filter(isMeanChangeGroup),
@@ -5367,8 +5797,27 @@
         });
         // Storm PROB winds must clear the active mean (header/FM/BECMG) by ≥delta.
         const withStormWinds = applyStormWindsVsActiveMean(reblocked, base);
+        // Final guard: TEMPO/PROB/BECMG never publish past the TAF validity end.
+        let clamped = clampGroupsToValidity(withStormWinds, validityEnd, base);
+        // Run fog-abut last so later prune/coalesce cannot restore the 1 h gap.
+        clamped = abutMeanCloudAfterFogProb(clamped, base);
+        const meansFinal = resolveBecmgFmOverlaps(
+            clamped.filter(isMeanChangeGroup),
+        ).sort(byStart);
+        const temposFinal = clamped.filter((group) => group.kind === 'TEMPO').sort(byStart);
+        const probsFinal = clamped
+            .filter((group) => group.kind === 'PROB30' || group.kind === 'PROB40')
+            .sort(byStart);
+        clamped = clampGroupsToValidity(
+            [...meansFinal, ...temposFinal, ...probsFinal],
+            validityEnd,
+            base,
+        );
+        clamped.forEach((group) => {
+            group.text = renderGroupText(group, base);
+        });
         const seen = new Set();
-        return withStormWinds.filter((group) => {
+        return clamped.filter((group) => {
             const key = group.text;
             if (seen.has(key)) {
                 return false;
@@ -5699,6 +6148,10 @@
             lclFt: lclHeightFt(tempC, dewpointC),
             profileCloudBaseFt: om?.profileCloudBaseFt ?? null,
             elevatedCloudBaseFt: om?.elevatedCloudBaseFt ?? null,
+            cbCloudBaseFt: om?.cbCloudBaseFt ?? null,
+            profileLevelSamples: Array.isArray(om?.profileLevelSamples)
+                ? om.profileLevelSamples
+                : null,
             omPrecipMm: om?.precipMm ?? null,
             omShowersMm: om?.showersMm ?? null,
             omWeatherCode: om?.weatherCode ?? null,
@@ -5720,36 +6173,86 @@
         };
     }
 
+    /** Soft RH/spread samples on the OM ladder — used to gate published low cloud. */
+    function collectProfileLevelSamples(hourly, hourIndex, elevationM) {
+        if (!hourly?.time || hourIndex < 0) {
+            return [];
+        }
+        const levelSet = new Set([
+            ...(THRESHOLDS.cloudBaseLevelsHpa || []),
+            ...(THRESHOLDS.cbCloudBaseLevelsHpa || []),
+        ]);
+        const elev = Number.isFinite(elevationM) ? elevationM : 0;
+        const samples = [];
+        [...levelSet].sort((a, b) => b - a).forEach((level) => {
+            const tempC = hourly[`temperature_${level}hPa`]?.[hourIndex];
+            let dewpointC = hourly[`dew_point_${level}hPa`]?.[hourIndex];
+            const rh = hourly[`relative_humidity_${level}hPa`]?.[hourIndex];
+            const heightM = hourly[`geopotential_height_${level}hPa`]?.[hourIndex];
+            if (!Number.isFinite(tempC) || !Number.isFinite(heightM)) {
+                return;
+            }
+            if (!Number.isFinite(dewpointC) && Number.isFinite(rh) && rh > 0) {
+                const clamped = Math.min(100, rh);
+                const gamma = Math.log(clamped / 100) + (17.67 * tempC) / (tempC + 243.5);
+                dewpointC = (243.5 * gamma) / (17.67 - gamma);
+            }
+            if (!Number.isFinite(dewpointC)) {
+                return;
+            }
+            samples.push({
+                levelHpa: level,
+                aglFt: Math.max(0, (heightM - elev) * 3.28084),
+                rh: Number.isFinite(rh) ? rh : null,
+                spread: tempC - dewpointC,
+            });
+        });
+        return samples;
+    }
+
     /**
      * AGL base of the first solid moist deck on the OM pressure ladder.
      * Used overnight when surface LCL is biased low by a nocturnal inversion.
      * minAglFt skips fog/shallow surface decks (elevated SCT under BR/FG).
+     * Optional levels / minRh / maxSpreadC / skipSurface for CB mid-level scans.
      */
-    function cloudBaseAglFtFromHourlyProfile(hourly, hourIndex, elevationM, { minAglFt = 0 } = {}) {
+    function cloudBaseAglFtFromHourlyProfile(hourly, hourIndex, elevationM, {
+        minAglFt = 0,
+        levels = null,
+        minRh = null,
+        maxSpreadC = null,
+        skipSurface = false,
+    } = {}) {
         if (!hourly?.time || hourIndex < 0) {
             return null;
         }
-        const levels = THRESHOLDS.cloudBaseLevelsHpa || [1000, 975, 950, 925, 900, 850];
-        const minRh = THRESHOLDS.cloudBaseMinRh || 95;
-        const maxSpread = THRESHOLDS.cloudBaseMaxSpreadC || 0.5;
+        const levelList = Array.isArray(levels) && levels.length
+            ? levels
+            : (THRESHOLDS.cloudBaseLevelsHpa || [1000, 975, 950, 925, 900, 850]);
+        const rhMin = Number.isFinite(minRh) ? minRh : (THRESHOLDS.cloudBaseMinRh || 95);
+        const maxSpread = Number.isFinite(maxSpreadC)
+            ? maxSpreadC
+            : (THRESHOLDS.cloudBaseMaxSpreadC || 0.5);
         const elev = Number.isFinite(elevationM) ? elevationM : 0;
         const floorFt = Number.isFinite(minAglFt) ? minAglFt : 0;
 
-        const sfcT = hourly.temperature_2m?.[hourIndex];
-        const sfcTd = hourly.dew_point_2m?.[hourIndex];
-        const sfcRh = hourly.relative_humidity_2m?.[hourIndex];
-        if (Number.isFinite(sfcT) && Number.isFinite(sfcTd)) {
-            const sfcSpread = sfcT - sfcTd;
-            if (sfcSpread <= maxSpread || (Number.isFinite(sfcRh) && sfcRh >= minRh)) {
-                const sfcBase = Math.max(0, lclHeightFt(sfcT, sfcTd) || 100);
-                // Surface-based cloud / fog — keep a very low base unless skipped.
-                if (sfcBase >= floorFt) {
-                    return sfcBase;
+        if (!skipSurface) {
+            const sfcT = hourly.temperature_2m?.[hourIndex];
+            const sfcTd = hourly.dew_point_2m?.[hourIndex];
+            const sfcRh = hourly.relative_humidity_2m?.[hourIndex];
+            if (Number.isFinite(sfcT) && Number.isFinite(sfcTd)) {
+                const sfcSpread = sfcT - sfcTd;
+                if (sfcSpread <= maxSpread || (Number.isFinite(sfcRh) && sfcRh >= rhMin)) {
+                    const sfcBase = Math.max(0, lclHeightFt(sfcT, sfcTd) || 100);
+                    // Surface-based cloud / fog — keep a very low base unless skipped.
+                    if (sfcBase >= floorFt) {
+                        return sfcBase;
+                    }
                 }
             }
         }
 
-        for (const level of levels) {
+        for (const level of levelList) {
             const tempC = hourly[`temperature_${level}hPa`]?.[hourIndex];
             let dewpointC = hourly[`dew_point_${level}hPa`]?.[hourIndex];
             const rh = hourly[`relative_humidity_${level}hPa`]?.[hourIndex];
@@ -5771,13 +6274,25 @@
                 continue;
             }
             const spread = tempC - dewpointC;
-            const moist = spread <= maxSpread || (Number.isFinite(rh) && rh >= minRh);
+            const moist = spread <= maxSpread || (Number.isFinite(rh) && rh >= rhMin);
             if (!moist) {
                 continue;
             }
             return aglFt;
         }
         return null;
+    }
+
+    /** Elevated mid-level moist deck for CB bases (skips surface / fog decks). */
+    function cbBaseAglFtFromHourlyProfile(hourly, hourIndex, elevationM) {
+        return cloudBaseAglFtFromHourlyProfile(hourly, hourIndex, elevationM, {
+            minAglFt: THRESHOLDS.cbCloudBaseMinAglFt || 1500,
+            levels: THRESHOLDS.cbCloudBaseLevelsHpa
+                || [1000, 975, 950, 925, 900, 850, 800, 700, 600],
+            minRh: THRESHOLDS.cbCloudBaseMinRh || 90,
+            maxSpreadC: THRESHOLDS.cbCloudBaseMaxSpreadC || 1.0,
+            skipSurface: true,
+        });
     }
 
     function extractOpenMeteoHour(hourly, hourIndex, { elevationM = null } = {}) {
@@ -5810,6 +6325,9 @@
             elevationM,
             { minAglFt: 1500 },
         );
+        // Mid-level moist deck for high-based CB (800/700/600 hPa).
+        const cbCloudBaseFt = cbBaseAglFtFromHourlyProfile(hourly, hourIndex, elevationM);
+        const profileLevelSamples = collectProfileLevelSamples(hourly, hourIndex, elevationM);
         const pressureMsl = hourly.pressure_msl?.[hourIndex];
         return {
             windKt: Number.isFinite(windKt) ? windKt : null,
@@ -5826,6 +6344,8 @@
             cloudBaseFt,
             profileCloudBaseFt,
             elevatedCloudBaseFt,
+            cbCloudBaseFt,
+            profileLevelSamples,
             qnhHpa: Number.isFinite(pressureMsl) ? pressureMsl : null,
         };
     }
@@ -6091,7 +6611,11 @@
         const start = startDate.toISOString().slice(0, 10);
         const end = endDate.toISOString().slice(0, 10);
         const levelVars = [];
-        (THRESHOLDS.cloudBaseLevelsHpa || []).forEach((level) => {
+        const levelSet = new Set([
+            ...(THRESHOLDS.cloudBaseLevelsHpa || []),
+            ...(THRESHOLDS.cbCloudBaseLevelsHpa || []),
+        ]);
+        [...levelSet].sort((a, b) => b - a).forEach((level) => {
             levelVars.push(
                 `temperature_${level}hPa`,
                 `dew_point_${level}hPa`,
